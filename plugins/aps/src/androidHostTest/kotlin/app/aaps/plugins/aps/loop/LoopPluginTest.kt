@@ -1,7 +1,5 @@
 package app.aaps.plugins.aps.loop
 
-import android.app.NotificationManager
-import android.content.Context
 import app.aaps.core.data.model.DS
 import app.aaps.core.data.model.RM
 import app.aaps.core.data.plugin.PluginType
@@ -24,7 +22,6 @@ import app.aaps.core.interfaces.pump.PumpStatusProvider
 import app.aaps.core.interfaces.pump.PumpWithConcentration
 import app.aaps.core.interfaces.queue.CommandQueue
 import app.aaps.core.interfaces.receivers.ReceiverStatusStore
-import app.aaps.core.interfaces.ui.UiInteraction
 import app.aaps.core.interfaces.utils.HardLimits
 import app.aaps.core.keys.interfaces.TextRef
 import app.aaps.core.objects.constraints.ConstraintObject
@@ -40,8 +37,8 @@ import kotlinx.coroutines.yield
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
-import org.json.JSONException
 import org.json.JSONObject
+import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
@@ -69,11 +66,9 @@ class LoopPluginTest : TestBaseWithProfile() {
     @Mock lateinit var receiverStatusStore: ReceiverStatusStore
     @Mock lateinit var persistenceLayer: PersistenceLayer
     @Mock lateinit var uel: UserEntryLogger
-    @Mock lateinit var uiInteraction: UiInteraction
     @Mock lateinit var processedDeviceStatusData: ProcessedDeviceStatusData
     @Mock lateinit var pumpStatusProvider: PumpStatusProvider
     @Mock lateinit var loopNotifier: LoopNotifier
-
 
     private lateinit var loopPlugin: LoopPlugin
     private val testScope = CoroutineScope(Dispatchers.Unconfined)
@@ -85,10 +80,23 @@ class LoopPluginTest : TestBaseWithProfile() {
             constraintChecker, rh, profileFunction, commandQueue, activePlugin, processedTbrEbData, receiverStatusStore, fabricPrivacy, dateUtil, uel,
             // The shared test base still hands out a javax Provider, which other tests rely on;
             // LoopPlugin takes Metro's now, so it is adapted here rather than flipping the base.
-            persistenceLayer, uiInteraction, notificationManager, { pumpEnactResultProvider() },
+            persistenceLayer, notificationManager, { pumpEnactResultProvider() },
             processedDeviceStatusData, pumpStatusProvider, decimalFormatter, ch, loopNotifier, testScope
         )
         whenever(activePlugin.activePump).thenReturn(virtualPumpPlugin)
+    }
+
+    /**
+     * Leave no live coroutine behind.
+     *
+     * [testScope] is a real scope on [Dispatchers.Unconfined], so a job left pending here does not die
+     * with the test - it waits out its `delay` and then runs against a half-stubbed plugin. The throw
+     * lands in kotlinx-coroutines-test's process-wide collector and is reported as
+     * `UncaughtExceptionsBeforeTest` against whichever unrelated `runTest` happens to start next, which
+     * is what it did to `allowedNextModes returns emptyList if profile is invalid`.
+     */
+    @AfterEach fun cancelPendingWork() {
+        loopPlugin.smbFallbackJob?.cancel()
     }
 
     @Test
@@ -106,10 +114,34 @@ class LoopPluginTest : TestBaseWithProfile() {
         // Plugin is enabled by default
         assertThat(loopPlugin.isEnabled()).isTrue()
 
-        // No temp basal capable pump should disable plugin
-        virtualPumpPlugin.pumpDescription.isTempBasalCapable = false
-        assertThat(loopPlugin.specialEnableCondition()).isFalse()
-        virtualPumpPlugin.pumpDescription.isTempBasalCapable = true
+        // A build with an APS of its own may run the loop
+        assertThat(loopPlugin.specialEnableCondition()).isTrue()
+    }
+
+    /**
+     * A client must never run the loop, whatever the stored flag says.
+     *
+     * `ConfigBuilder_Enabled_LOOP_*` is exportable and is not a synced key, so importing a master's
+     * settings writes it on a client too. `specialEnableCondition` is what stops it: `PluginBase.isEnabled`
+     * ANDs it with the stored state, so it beats the flag rather than sitting beside it. See #5145.
+     *
+     * This asserts the condition itself rather than driving the state machine: `setPluginEnabled` starts
+     * the plugin on a real scope, and a collector left running here would outlive the test - see
+     * [cancelPendingWork].
+     */
+    @Test
+    fun `a client may not run the loop`() {
+        whenever(config.APS).thenReturn(false)
+        val clientLoopPlugin = LoopPlugin(
+            aapsLogger, rxBus, preferences, config,
+            constraintChecker, rh, profileFunction, commandQueue, activePlugin, processedTbrEbData, receiverStatusStore, fabricPrivacy, dateUtil, uel,
+            persistenceLayer, uiInteraction, notificationManager, { pumpEnactResultProvider() },
+            processedDeviceStatusData, pumpStatusProvider, decimalFormatter, ch, loopNotifier, testScope
+        )
+
+        assertThat(clientLoopPlugin.specialEnableCondition()).isFalse()
+        // Not force-enabled either: alwaysEnabled is config.APS, so isEnabled cannot short-circuit to true
+        assertThat(clientLoopPlugin.isEnabled()).isFalse()
     }
 
     @Test
@@ -610,7 +642,7 @@ class LoopPluginTest : TestBaseWithProfile() {
         val holdFirstRead = AtomicBoolean(true)
 
         persistenceLayer.stub {
-            onBlocking { getRunningModeActiveAt(any()) } doSuspendableAnswer {
+            on { getRunningModeActiveAt(any()) } doSuspendableAnswer {
                 // Snapshot BEFORE the hold: a real read returns what the row said when it ran, so holding
                 // it must not let this caller pick up a write that landed while it waited. Returning
                 // stored.get() after the await makes the test pass with or without the lock.
@@ -621,7 +653,7 @@ class LoopPluginTest : TestBaseWithProfile() {
                 }
                 atReadTime
             }
-            onBlocking { insertOrUpdateRunningMode(any(), any(), any(), anyOrNull(), any()) } doSuspendableAnswer { invocation ->
+            on { insertOrUpdateRunningMode(any(), any(), any(), anyOrNull(), any()) } doSuspendableAnswer { invocation ->
                 stored.set(invocation.getArgument(0))
                 PersistenceLayer.TransactionResult()
             }
@@ -799,7 +831,7 @@ class LoopPluginTest : TestBaseWithProfile() {
         // The pump command hangs until the test releases it, so the cancel below is guaranteed to
         // arrive while it is still in flight.
         commandQueue.stub {
-            onBlocking { tempBasalAbsolute(any(), any(), any(), any(), any()) } doSuspendableAnswer {
+            on { tempBasalAbsolute(any(), any(), any(), any(), any()) } doSuspendableAnswer {
                 commandStarted.complete(Unit)
                 releaseCommand.await()
                 enacted
@@ -854,5 +886,37 @@ class LoopPluginTest : TestBaseWithProfile() {
         verify(commandQueue, never()).tempBasalAbsolute(any(), any(), any(), any(), any())
         verify(commandQueue, never()).tempBasalPercent(any(), any(), any(), any(), any())
         assertThat(loopPlugin.lastRun?.lastOpenModeAccept).isEqualTo(0L)
+    }
+
+    /**
+     * The deferred SMB fallback must not outlive the plugin.
+     *
+     * It re-runs the loop a second later, so a plugin stopped in between - which a settings import
+     * does to every plugin - would otherwise have it wake up and queue commands against a pump driver
+     * that is being torn down. It ran on the application scope and nothing owned it.
+     */
+    @Test
+    fun `onStop cancels the deferred SMB fallback`() = runTest {
+        loopPlugin.scheduleSmbFallback(allowNotification = false)
+        val scheduled = loopPlugin.smbFallbackJob
+        assertThat(scheduled).isNotNull()
+        assertThat(scheduled!!.isActive).isTrue()
+
+        loopPlugin.onStop()
+
+        assertThat(scheduled.isCancelled).isTrue()
+    }
+
+    /** Two failures in the same second schedule one re-run, not two stacked on the invoke mutex. */
+    @Test
+    fun `scheduling the fallback again replaces the pending one`() = runTest {
+        loopPlugin.scheduleSmbFallback(allowNotification = false)
+        val first = loopPlugin.smbFallbackJob
+
+        loopPlugin.scheduleSmbFallback(allowNotification = false)
+
+        assertThat(first!!.isCancelled).isTrue()
+        assertThat(loopPlugin.smbFallbackJob).isNotSameInstanceAs(first)
+        assertThat(loopPlugin.smbFallbackJob!!.isActive).isTrue()
     }
 }
