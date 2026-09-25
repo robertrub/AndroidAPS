@@ -15,6 +15,7 @@ import app.aaps.core.interfaces.constraints.ConstraintsChecker
 import app.aaps.core.interfaces.db.PersistenceLayer
 import app.aaps.core.interfaces.logging.UserEntryLogger
 import app.aaps.core.interfaces.nsclient.ProcessedDeviceStatusData
+import app.aaps.core.interfaces.plugin.EnforcedState
 import app.aaps.core.interfaces.profile.EffectiveProfile
 import app.aaps.core.interfaces.pump.PumpEnactResult
 import app.aaps.core.interfaces.pump.PumpRate
@@ -75,16 +76,26 @@ class LoopPluginTest : TestBaseWithProfile() {
 
     @BeforeEach fun prepare() {
         whenever(config.APS).thenReturn(true)
-        loopPlugin = LoopPlugin(
-            aapsLogger, rxBus, preferences, config,
-            constraintChecker, rh, profileFunction, commandQueue, activePlugin, processedTbrEbData, receiverStatusStore, fabricPrivacy, dateUtil, uel,
-            // The shared test base still hands out a javax Provider, which other tests rely on;
-            // LoopPlugin takes Metro's now, so it is adapted here rather than flipping the base.
-            persistenceLayer, notificationManager, { pumpEnactResultProvider() },
-            processedDeviceStatusData, pumpStatusProvider, decimalFormatter, ch, loopNotifier, testScope
-        )
+        loopPlugin = buildLoopPlugin()
         whenever(activePlugin.activePump).thenReturn(virtualPumpPlugin)
     }
+
+    /**
+     * The ONLY place this test constructs a [LoopPlugin].
+     *
+     * A second copy of this argument list broke the build once already: `uiInteraction` was dropped from the
+     * constructor, the copy in `prepare` was updated and the one in a test body was not. A test that needs
+     * its own instance - one built with a different `config` stubbing, say - calls this instead of pasting
+     * the list again.
+     */
+    private fun buildLoopPlugin() = LoopPlugin(
+        aapsLogger, rxBus, preferences, config,
+        constraintChecker, baseText, profileFunction, commandQueue, activePlugin, processedTbrEbData, receiverStatusStore, fabricPrivacy, dateUtil, uel,
+        // The shared test base still hands out a javax Provider, which other tests rely on;
+        // LoopPlugin takes Metro's now, so it is adapted here rather than flipping the base.
+        persistenceLayer, notificationManager, { pumpEnactResultProvider() },
+        processedDeviceStatusData, pumpStatusProvider, decimalFormatter, ch, loopNotifier, testScope
+    )
 
     /**
      * Leave no live coroutine behind.
@@ -109,38 +120,33 @@ class LoopPluginTest : TestBaseWithProfile() {
         assertThat(loopPlugin.getType()).isEqualTo(PluginType.LOOP)
         assertThat(loopPlugin.name).isEqualTo("Loop")
         assertThat(loopPlugin.nameShort).isEqualTo("LOOP")
-        assertThat(loopPlugin.showInList(PluginType.LOOP)).isTrue()
+        assertThat(loopPlugin.showInList()).isTrue()
 
         // Plugin is enabled by default
         assertThat(loopPlugin.isEnabled()).isTrue()
 
         // A build with an APS of its own may run the loop
-        assertThat(loopPlugin.specialEnableCondition()).isTrue()
+        assertThat(loopPlugin.enforcedState()).isEqualTo(EnforcedState.Enabled)
     }
 
     /**
      * A client must never run the loop, whatever the stored flag says.
      *
      * `ConfigBuilder_Enabled_LOOP_*` is exportable and is not a synced key, so importing a master's
-     * settings writes it on a client too. `specialEnableCondition` is what stops it: `PluginBase.isEnabled`
-     * ANDs it with the stored state, so it beats the flag rather than sitting beside it. See #5145.
+     * settings writes it on a client too. The forced-off enforcement is what stops it: `PluginBase.isEnabled`
+     * is answered from the enforcement before the stored state is consulted, so it beats the flag. See #5145.
      *
-     * This asserts the condition itself rather than driving the state machine: `setPluginEnabled` starts
+     * This asserts the enforcement itself rather than driving the state machine: `setPluginEnabled` starts
      * the plugin on a real scope, and a collector left running here would outlive the test - see
      * [cancelPendingWork].
      */
     @Test
     fun `a client may not run the loop`() {
         whenever(config.APS).thenReturn(false)
-        val clientLoopPlugin = LoopPlugin(
-            aapsLogger, rxBus, preferences, config,
-            constraintChecker, rh, profileFunction, commandQueue, activePlugin, processedTbrEbData, receiverStatusStore, fabricPrivacy, dateUtil, uel,
-            persistenceLayer, uiInteraction, notificationManager, { pumpEnactResultProvider() },
-            processedDeviceStatusData, pumpStatusProvider, decimalFormatter, ch, loopNotifier, testScope
-        )
+        val clientLoopPlugin = buildLoopPlugin()
 
-        assertThat(clientLoopPlugin.specialEnableCondition()).isFalse()
-        // Not force-enabled either: alwaysEnabled is config.APS, so isEnabled cannot short-circuit to true
+        assertThat(clientLoopPlugin.enforcedState()).isEqualTo(EnforcedState.Disabled)
+        // Enforced DISABLED on a client, so isEnabled is false whatever the stored flag says
         assertThat(clientLoopPlugin.isEnabled()).isFalse()
     }
 
